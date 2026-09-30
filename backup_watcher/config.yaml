@@ -2,6 +2,7 @@ name: "Backup Watcher"
 version: "1.0.0"
 slug: "backup_watcher"
 description: "Watch for new backups created, sync to local core accessible folder, upload to server via FTPs - this addon monitors the /backup folder for new files and syncs these to defined local folder within /share directory accessible from Core for any automations and scripts and / or uploads these backup files to a remote FTP server using FTPs (implicitly or explicitly, not requiring SFTP)"
+url: "https://github.com/th23x/th23-backup-watcher"
 arch:
   - aarch64
   - amd64
