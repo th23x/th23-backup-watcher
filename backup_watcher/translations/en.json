@@ -1,0 +1,48 @@
+{
+  "configuration": {
+    "local_copy_enabled": {
+	  "name": "Local Copy",
+      "description": "Sync local copy of files in the '/backup' directory to a '/share' subfolder accessible within HA Core for automations and scripts"
+    },
+    "local_copy_subdir": {
+	  "name": "Local folder",
+      "description": "Local target folder underneath '/share', separate multiple layers by a '/' slash charater, eg 'backups/your-choice'"
+    },
+    "ftps_enabled": {
+     "name": "FTPs Upload",
+      "description": "Enable sync of files in the '/backup' directory to a FTPs server"
+    },
+    "ftps_host": {
+     "name": "FTPs Host",
+     "description": "IP address or domain hostname of FTPs server"
+    },
+    "ftps_port": {
+     "name": "FTPs Port",
+     "description": "Port of FTPs server, usually 21"
+    },
+    "ftps_user": {
+     "name": "FTPs Username",
+     "description": "Username to authenticate at FTPs server"
+    },
+    "ftps_password": {
+      "name": "FTPs Password",
+     "description": "Password to authenticate at FTPs server"
+    },
+    "ftps_implicit": {
+      "name": "FTPs Implicit",
+      "description": "Force implicit FTPs, if required, default 'off' as most servers use explicit"
+    },
+    "ftps_verify_cert": {
+      "name": "FTPs Certificate",
+     "description": "Verify FTPs server certificate, disable in case your server only has a self-signed certificate"
+    },
+    "ftps_remote_dir": {
+      "name": "FTPs Path",
+      "description": "Target folder at FTPs server, ensure ending with '/' slash character, e.g. 'backups/'"
+	},
+	"ftps_sync_deletions": {
+	  "name": "FTPs Deletions",
+	  "description": "Delete backups from FTPs server once they are removed locally"
+	}
+  }
+}

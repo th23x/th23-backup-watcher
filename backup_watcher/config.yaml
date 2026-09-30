@@ -1,0 +1,40 @@
+name: "Backup Watcher"
+version: "1.0.0"
+slug: "backup_watcher"
+description: "Watch for new backups created, sync to local core accessible folder, upload to server via FTPs - this addon monitors the /backup folder for new files and syncs these to defined local folder within /share directory accessible from Core for any automations and scripts and / or uploads these backup files to a remote FTP server using FTPs (implicitly or explicitly, not requiring SFTP)"
+arch:
+  - aarch64
+  - amd64
+init: false
+homeassistant_api: true
+map:
+  - type: backup
+    read_only: true
+  - type: share
+    read_only: false
+boot: auto
+startup: application
+options:
+  local_copy_enabled: true
+  local_copy_subdir: "backups"
+  ftps_enabled: false
+  ftps_host: ""
+  ftps_port: 21
+  ftps_user: ""
+  ftps_password: ""
+  ftps_implicit: false
+  ftps_verify_cert: true
+  ftps_remote_dir: "/backups"
+  ftps_sync_deletions: false
+schema:
+  local_copy_enabled: bool
+  local_copy_subdir: str
+  ftps_enabled: bool
+  ftps_host: str
+  ftps_port: port
+  ftps_user: str
+  ftps_password: password
+  ftps_implicit: bool
+  ftps_verify_cert: bool
+  ftps_remote_dir: str
+  ftps_sync_deletions: bool
