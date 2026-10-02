@@ -1,12 +1,20 @@
 {
   "configuration": {
+    "allow_unencrypted_backups": {
+      "name": "Allow unencrypted backups",
+      "description": "IMPORTANT: Syncing unencrypted backups to '/share' locally or a remote location might expose sensitive data like secrets in plaintext! No backups without encryption flag will be handled, without explicit permission here"
+    },
     "local_copy_enabled": {
-	  "name": "Local Copy",
+      "name": "Local Copy",
       "description": "Sync local copy of files in the '/backup' directory to a '/share' subfolder accessible within HA Core for automations and scripts"
     },
     "local_copy_subdir": {
-	  "name": "Local folder",
+      "name": "Local folder",
       "description": "Local target folder underneath '/share', separate multiple layers by a '/' slash charater, eg 'backups/your-choice'"
+    },
+    "local_sync_deletions": {
+      "name": "Local Sync Deletions",
+      "description": "Delete backups from local target folder underneath '/share' once they are removed from the '/backup' directory, eg by the Home Assistant setting to keep only last 3 backups"
     },
     "ftps_enabled": {
      "name": "FTPs Upload",
@@ -34,15 +42,23 @@
     },
     "ftps_verify_cert": {
       "name": "FTPs Certificate",
-     "description": "Verify FTPs server certificate, disable in case your server only has a self-signed certificate"
+     "description": "Verify FTPs server certificate"
+    },
+    "ftps_check_hostname": {
+      "name": "FTPs Check Hostname",
+      "description": "Verify FTPs server hostname, in case of issues disable this in case you use a self-signed certificate"
+    },
+    "ftps_ca_file": {
+      "name": "FTPs Self-Signed Certificate",
+      "description": "Optional: File name of a PEM / CA certificate to verify the FTPs server, stored within this app's configuration folder, e.g. 'ftps_ca.pem'. Leave empty to use the system certificates. 'FTPs Host' above has to match the certificate."
     },
     "ftps_remote_dir": {
       "name": "FTPs Path",
       "description": "Target folder at FTPs server, ensure ending with '/' slash character, e.g. 'backups/'"
-	},
-	"ftps_sync_deletions": {
-	  "name": "FTPs Deletions",
-	  "description": "Delete backups from FTPs server once they are removed locally"
-	}
+    },
+    "ftps_sync_deletions": {
+      "name": "FTPs Sync Deletions",
+      "description": "Delete backups from FTPs server once they are removed locally"
+    }
   }
 }
