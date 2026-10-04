@@ -2,20 +2,20 @@
 
 [![Add to Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fth23x%2Fth23-backup-watcher)
 
-Copying new backups to local folder or remote FTPs server
+Uploads and synchronizes backups to remote FTPs server
 
 ## About
 
-Watches the `/backup` folder for new backups (not accessible from the dashboard), copies them to a local folder under `/share` (accessible from Home Assistant Core) and optionally uploads them to a remote server via FTPs (no SFTP access required).
+Watches the `/backup` folder for new backups (not accessible from the dashboard) and uploads them to a remote server via FTPs (no SFTP access required). Option to keep remote files in sync with those at Home Assistant server, deleting remotely once removed locally, eg for keeping last 3 backups only.
 
 ## Features
 
 - Backup routine remains defined by default Home Assistant settings
 - Detects newly created backup files (`.tar`) automatically
-- Automatic local copy to `/share/<folder>` where files are accessible for use in automations and scripts
-- Automatic upload to remote server via FTPs, either explicit (STARTTLS) or implicit (no SFTP required)
-- Number of backups is synced as defined in Home Assistant settings, backups deleted locally can also be deleted remotely
-- Fires events as triggers for automations on success and failure
+- Automatic upload to remote server via FTPs, either explicit (`AUTH TLS`) or implicit (no SFTP required)
+- Optional deletion sync: backups deleted in Home Assistant (for example by its retention settings) are also deleted on the server
+- Only encrypted backups are uploaded by default, unencrypted ones are skipped and reported unless you allow them
+- Fires events as triggers for own automations on success and failure
 
 ## Installation
 
@@ -28,14 +28,15 @@ Watches the `/backup` folder for new backups (not accessible from the dashboard)
 
 ## Configuration
 
-Open **Configuration** for all available settings and descriptions to each
+Open **Configuration** tab in Home Assistant under `Settings` -> `Apps` -> `Backup Watcher` for all available settings and descriptions to each
 
 ## Events
 
-`new_backup_copied` once local copy succeeded
-`new_backup_copy_failed` in case local copy failed
-`new_backup_uploaded` once FTPs upload succeeded
-`new_backup_upload_failed` in case FTPs upload failed
+- `new_backup_uploaded` once a backup was uploaded, verified and published under its final name
+- `new_backup_upload_failed` in case an upload attempt failed
+- `new_backup_skipped` once a backup was deliberately **not** uploaded
+
+For more details about events, see **Documentation** tab in Home Assistant under `Settings` -> `Apps` -> `Backup Watcher`
 
 Example automation utilizing such event:
 
@@ -51,13 +52,13 @@ actions:
 
 ## Notes
 
-- Credentials are stored only in the app configuration
-- The FTPs server must support encrypted connections, plain FTP without is not supported
+- The FTPs server must support TLS 1.2 or newer, plain FTP is not supported
 - Backups contain sensitive data: **Enable backup encryption in Home Assistant before uploading to a remote server!**
+- The FTPs password is stored in the app configuration, which is part of your Home Assistant backups, see **Secrets in your backups** in the Documentation tab
 
 ## Troubleshooting
 
-Check the apps **Log** tab for error messages
+Check the app's **Log** tab for error messages, and the **Troubleshooting** section of the Documentation tab for what they mean
 
 ## License
 

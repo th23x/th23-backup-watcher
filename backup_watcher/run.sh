@@ -8,25 +8,27 @@ set -euo pipefail
 
 # basic constants
 SRC="/backup"
-SHARE_ROOT="/share"
-FTPS_STATE_DIR="/data/ftps_uploaded"  # tracks files uploaded to server, survives restarts as /data is persistent
-LOCAL_FREE_BYTES=$((1024 * 1024 * 1024))  # keep 1 GB of headroom on disk before creating local backup copies
+APP_CONFIG_DIR="/config"
+FTPS_DESTINATION_FILE="/data/ftps_destination" # destination the upload records belong to, the records are reset if it changes
+FTPS_STATE_DIR="/data/ftps_uploaded" # tracks files uploaded to server, survives restarts as /data is persistent
+FTPS_INPROGRESS_FILE="/data/ftps_upload_in_progress" # remote temp files per line, tracking leftovers in case of hard stops midway
+SKIPPED_DIR="/tmp/backup_skipped" # backups already reported as skipped, see backup_skipped function
+FAILED_DIR="/tmp/backup_upload_failed" # failed uploads: attempts, last reason, next retry, see ftps_upload_failed function
+RETRY_MAX_DELAY=86100 # seconds: wait between retries of failed upload grows with each failure, but never beyond (just under) a day
+BACKUP_JSON_MAX_BYTES=262144 # backup.json is a few KB, anything larger than 256 KiB is not read (and counts as "unknown")
+ENCRYPTION_CACHE_DIR="/tmp/backup_encryption" # remembered results per backup, /tmp is cleared on restart
 
 # handle HA shutdown commands (instead waiting for a hard "kill")
-CURRENT_TMP="" # temp file of a local copy in progress
-CP_PID="" # background copy process of that local copy
 # runs on every exit (stop request, fatal error, normal end): remove the partial copy still in progress
 on_exit() {
-    if [ -n "$CURRENT_TMP" ]; then
-        rm -f -- "$CURRENT_TMP" 2>/dev/null || true
-    fi
+    # stop any ongoing upload
+    pkill -x lftp 2>/dev/null || true
+    # stop the inotifywait started by watch_backups
+    pkill -x inotifywait 2>/dev/null || true
 }
 # runs on a stop request from Supervisor / Docker (SIGTERM) or Ctrl-C when testing manually (SIGINT)
 on_stop() {
     bashio::log.info "Stop requested, shutting down"
-    if [ -n "$CP_PID" ]; then
-        kill "$CP_PID" 2>/dev/null || true
-    fi
     exit 0  # runs the EXIT trap
 }
 trap on_stop SIGTERM SIGINT
@@ -35,56 +37,12 @@ trap on_exit EXIT
 # security: allow unencrypted backups
 ALLOW_UNENCRYPTED=$(bashio::config 'allow_unencrypted_backups')
 if [ "$ALLOW_UNENCRYPTED" = "true" ]; then
-    bashio::log.warning "allow_unencrypted_backups is on: Unencrypted backups (with secrets in plain text) will be copied / uploaded!"
+    bashio::log.warning "allow_unencrypted_backups is on: Unencrypted backups (with secrets in plain text) will be uploaded!"
 else
-    bashio::log.info "Only encrypted backups will be copied / uploaded"
+    bashio::log.info "Only encrypted backups will be uploaded"
 fi
-
-# local copy config
-LOCAL_COPY_ENABLED=$(bashio::config 'local_copy_enabled')
-LOCAL_COPY_SUBDIR=$(bashio::config 'local_copy_subdir')
-# sanitize: strip leading and trailing slashes
-LOCAL_COPY_SUBDIR="${LOCAL_COPY_SUBDIR#/}"
-LOCAL_COPY_SUBDIR="${LOCAL_COPY_SUBDIR%/}"
-# sanitize: reject any ".." path segments to prevent escaping root
-LOCAL_COPY_CLEAN=""
-IFS='/' read -ra SEGMENTS <<< "$LOCAL_COPY_SUBDIR"
-for seg in "${SEGMENTS[@]}"; do
-    case "$seg" in
-        ""|".") continue ;;
-        "..")
-            bashio::log.warning "local_copy_subdir contains '..' as path segment, ignoring it"
-            LOCAL_COPY_CLEAN=""
-            break
-            ;;
-        *) LOCAL_COPY_CLEAN="${LOCAL_COPY_CLEAN:+${LOCAL_COPY_CLEAN}/}${seg}" ;;
-    esac
-done
-LOCAL_COPY_SUBDIR="$LOCAL_COPY_CLEAN"
-# never use the "/share" root directly, as sync would remove unrelated *.tar files there
-if [ -z "$LOCAL_COPY_SUBDIR" ]; then
-    LOCAL_COPY_SUBDIR="backups"
-    bashio::log.warning "local_copy_subdir is empty or invalid, using default '${LOCAL_COPY_SUBDIR}'"
-fi
-DEST="${SHARE_ROOT}/${LOCAL_COPY_SUBDIR}"
-# log status of local copy, ensure target folder exists
-if [ "$LOCAL_COPY_ENABLED" = "true" ]; then
-    mkdir -p "$DEST"
-    # remove leftovers of a copy interrupted by a crash or kill (this app is the only writer)
-    for stale in "${DEST}"/*.tar.tmp; do
-        [ -e "$stale" ] || continue
-        if rm -f -- "$stale"; then
-            bashio::log.info "Local: removed stale temp file $(basename "$stale")"
-        fi
-    done
-    bashio::log.info "Local copy enabled: ${SRC} -> ${DEST}"
-else
-    bashio::log.info "Local copy disabled"
-fi
-LOCAL_SYNC_DELETIONS=$(bashio::config 'local_sync_deletions')
 
 # FTPs upload configuration
-FTPS_ENABLED=$(bashio::config 'ftps_enabled')
 FTPS_HOST=$(bashio::config 'ftps_host')
 FTPS_PORT=$(bashio::config 'ftps_port')
 FTPS_IMPLICIT=$(bashio::config 'ftps_implicit')
@@ -92,46 +50,120 @@ FTPS_USER=$(bashio::config 'ftps_user')
 FTPS_PASSWORD=$(bashio::config 'ftps_password')
 FTPS_REMOTE_DIR=$(bashio::config 'ftps_remote_dir')
 FTPS_VERIFY_CERT=$(bashio::config 'ftps_verify_cert')
-FTPS_CHECK_HOSTNAME=$(bashio::config 'ftps_check_hostname')
 FTPS_CA_FILE=$(bashio::config 'ftps_ca_file')
 # unset optional value comes back as "null", convert to empty string instead
 if [ "$FTPS_CA_FILE" = "null" ]; then FTPS_CA_FILE=""; fi
-# limit file name to inside the app's private configuration folder
-if [ -n "$FTPS_CA_FILE" ]; then FTPS_CA_FILE="/config/${FTPS_CA_FILE}"; fi
+# limit file name to inside the app's private configuration folder (schema forbids any "/")
+if [ -n "$FTPS_CA_FILE" ]; then FTPS_CA_FILE="${APP_CONFIG_DIR}/${FTPS_CA_FILE}"; fi
+FTPS_CHECK_HOSTNAME=$(bashio::config 'ftps_check_hostname')
 FTPS_SYNC_DELETIONS=$(bashio::config 'ftps_sync_deletions')
-# log status of FTPs upload and ensure folder for persistent upload tracking exists
-if [ "$FTPS_ENABLED" = "true" ]; then
-    if [ -z "$FTPS_HOST" ] || [ -z "$FTPS_USER" ] || [ -z "$FTPS_PASSWORD" ]; then
-        bashio::log.warning "ftps upload enabled but missing host / user / password; disabling FTPS upload"
-        FTPS_ENABLED="false"
-    # note: also rejects theoretically valid files named eg "my..cert.pem"
-    elif [ "$FTPS_VERIFY_CERT" = "true" ] && [ -n "$FTPS_CA_FILE" ] \
-         && { [[ "$FTPS_CA_FILE" == *..* ]] \
-              || ! { [ -r "$FTPS_CA_FILE" ] && grep -q 'BEGIN CERTIFICATE' "$FTPS_CA_FILE"; }; }; then
-        bashio::log.error "ftps_ca_file must be the name of a PEM certificate inside the app's configuration folder (found: '${FTPS_CA_FILE}'); disabling FTPS upload"
-        FTPS_ENABLED="false"
-    elif [ "$FTPS_VERIFY_CERT" = "true" ] && [ "$FTPS_CHECK_HOSTNAME" != "true" ] && [ -z "$FTPS_CA_FILE" ]; then
-		bashio::log.error "ftps_check_hostname can only be turned off together with a ftps_ca_file, otherwise any publicly trusted certificate would be accepted; disabling FTPS upload"
-        FTPS_ENABLED="false"
-    else
-        bashio::log.info "FTPs upload enabled: ${FTPS_USER}@${FTPS_HOST}:${FTPS_PORT}${FTPS_REMOTE_DIR} (implicit=${FTPS_IMPLICIT}, verify_cert=${FTPS_VERIFY_CERT}, check_hostname=${FTPS_CHECK_HOSTNAME}, ca_file=${FTPS_CA_FILE:-system}, sync_deletions=${FTPS_SYNC_DELETIONS})"
-        if [ "$FTPS_VERIFY_CERT" != "true" ]; then
-            bashio::log.warning "ftps_verify_cert is off: password and backups are exposed to man-in-the-middle attacks. Use ftps_ca_file instead"
-            [ -z "$FTPS_CA_FILE" ] || bashio::log.warning "ftps_ca_file is ignored while ftps_verify_cert is off"
-        elif [ "$FTPS_CHECK_HOSTNAME" != "true" ]; then
-            bashio::log.warning "ftps_check_hostname is off: the server name is not checked, only the certificate in ftps_ca_file is trusted. It must be the server's own certificate (or a CA you alone control)"
+FTPS_ATOMIC_UPLOAD=$(bashio::config 'ftps_atomic_upload')
+# only an explicit false turns it off (unset comes back as "null")
+if [ "$FTPS_ATOMIC_UPLOAD" != "false" ]; then FTPS_ATOMIC_UPLOAD="true"; fi
+
+# validate configuration: without a usable FTPs upload app won't work, so any problem is fatal
+CONFIG_ERRORS=()
+
+# prevent control characters in text options
+# note: values end up in the lftp script line by line, so a line break would start a new lftp command (not acceptable)
+# note: the schema already rejects control characters in host, user, remote dir and CA file, the password can only be checked here
+bad_fields=()
+[[ "$FTPS_HOST" =~ [[:cntrl:]] ]] && bad_fields+=("ftps_host") || true
+[[ "$FTPS_USER" =~ [[:cntrl:]] ]] && bad_fields+=("ftps_user") || true
+[[ "$FTPS_PASSWORD" =~ [[:cntrl:]] ]] && bad_fields+=("ftps_password") || true
+[[ "$FTPS_REMOTE_DIR" =~ [[:cntrl:]] ]] && bad_fields+=("ftps_remote_dir") || true
+[[ "$FTPS_CA_FILE" =~ [[:cntrl:]] ]] && bad_fields+=("ftps_ca_file") || true
+if [ "${#bad_fields[@]}" -gt 0 ]; then
+    bad_list=$(IFS=,; echo "${bad_fields[*]}")
+    bashio::log.error "Invalid configuration, control characters (eg a line break) found in: ${bad_list//,/, }"
+    bashio::log.error "Exiting: fix the configuration and start the app again"
+    # exit code 0: a restart can not fix a configuration error, so Supervisor's watchdog (user setting) must not restart in a loop
+    exit 0
+fi
+
+# ensure proper configuration
+[ -n "$FTPS_HOST" ] || CONFIG_ERRORS+=("ftps_host is empty")
+[ -n "$FTPS_USER" ] || CONFIG_ERRORS+=("ftps_user is empty")
+[ -n "$FTPS_PASSWORD" ] || CONFIG_ERRORS+=("ftps_password is empty")
+[[ "$FTPS_REMOTE_DIR" != /* ]] || CONFIG_ERRORS+=("ftps_remote_dir must not start with /")
+if [ "$FTPS_VERIFY_CERT" = "true" ]; then
+    if [ -n "$FTPS_CA_FILE" ]; then
+        # resolve symlinks: the real file must be a regular file inside the app's configuration folder
+        ca_real=$(realpath "$FTPS_CA_FILE" 2>/dev/null || true)
+        if [ -z "$ca_real" ] || [ ! -e "$ca_real" ]; then
+            CONFIG_ERRORS+=("ftps_ca_file '${FTPS_CA_FILE}' not found")
+        elif [[ "$ca_real" != "${APP_CONFIG_DIR}"/* ]]; then
+            CONFIG_ERRORS+=("ftps_ca_file '${FTPS_CA_FILE}' resolves to a file outside the app's configuration folder (symlink)")
+        elif [ ! -f "$ca_real" ] || [ ! -r "$ca_real" ] || ! grep -q 'BEGIN CERTIFICATE' "$ca_real"; then
+            CONFIG_ERRORS+=("ftps_ca_file '${FTPS_CA_FILE}' is not a readable PEM certificate file")
+        else
+            FTPS_CA_FILE="$ca_real"   # let lftp read exactly the file that was checked
         fi
-        mkdir -p "$FTPS_STATE_DIR"
+    fi
+    if [ "$FTPS_CHECK_HOSTNAME" != "true" ] && [ -z "$FTPS_CA_FILE" ]; then
+        CONFIG_ERRORS+=("ftps_check_hostname can only be turned off together with a ftps_ca_file, otherwise any publicly trusted certificate would be accepted")
     fi
 fi
+if [ "${#CONFIG_ERRORS[@]}" -gt 0 ]; then
+    for err in "${CONFIG_ERRORS[@]}"; do
+        bashio::log.error "Invalid configuration: ${err}"
+    done
+    bashio::log.error "Exiting: fix the configuration and start the app again"
+    # exit code 0: a restart can not fix a configuration error, so Supervisor's watchdog (user setting) must not restart in a loop
+    exit 0
+fi
+
+# implicit FTPs does not work on port 21 (explicit FTPs), recommend using the standard port 990 instead
+if [ "$FTPS_IMPLICIT" = "true" ] && [ "$FTPS_PORT" = "21" ]; then
+    bashio::log.warning "ftps_implicit is on, but port 21 is the explicit FTPs port, which might not work properly. Change configuration to use port 990 instead, the standard for implicit FTPs"
+fi
+
+# log status of FTPs upload
+bashio::log.info "FTPs upload to ${FTPS_USER}@${FTPS_HOST}:${FTPS_PORT}/${FTPS_REMOTE_DIR} (implicit=${FTPS_IMPLICIT}, verify_cert=${FTPS_VERIFY_CERT}, check_hostname=${FTPS_CHECK_HOSTNAME}, ca_file=${FTPS_CA_FILE:-system}, sync_deletions=${FTPS_SYNC_DELETIONS})"
+if [ "$FTPS_VERIFY_CERT" != "true" ]; then
+    bashio::log.warning "ftps_verify_cert is off: password and backups are exposed to man-in-the-middle attacks. Use ftps_ca_file instead"
+    [ -z "$FTPS_CA_FILE" ] || bashio::log.warning "ftps_ca_file is ignored while ftps_verify_cert is off"
+elif [ "$FTPS_CHECK_HOSTNAME" != "true" ]; then
+    bashio::log.warning "ftps_check_hostname is off: the server name is not checked, only the certificate in ftps_ca_file is trusted. It must be the server's own certificate (or a CA you alone control)"
+fi
+if [ "$FTPS_ATOMIC_UPLOAD" != "true" ]; then
+    bashio::log.warning "ftps_atomic_upload is off: backups are uploaded straight to their final name, so a failed upload can leave an incomplete file on the server until the next attempt replaces it"
+fi
+
+# ensure required directories exist
+mkdir -p "$FTPS_STATE_DIR" # persistent own uploads states
+mkdir -p "$ENCRYPTION_CACHE_DIR" # temporary cache directory for encryption status
+mkdir -p "$SKIPPED_DIR" # skipped backup files
+mkdir -p "$FAILED_DIR" # failed uploads, for back-off
+
+# the upload records only make sense for the server and folder they were made for
+# if the destination changed, forget them, so existing backups are uploaded to the new place
+# note: nothing is deleted on the old destination
+# note: other settings like port, password, etc are not part of the destination, a change there is usually still the same server
+check_destination() {
+    local dir="$FTPS_REMOTE_DIR" destination previous s records=0
+    while [[ "$dir" == */ ]]; do dir=${dir%/}; done
+    destination="${FTPS_USER}@${FTPS_HOST,,}/${dir}"
+    # no record yet (first start, or update from an older version): just remember it, the existing records stay
+    if [ -f "$FTPS_DESTINATION_FILE" ]; then
+        previous=$(head -n 1 "$FTPS_DESTINATION_FILE")
+        if [ "$previous" != "$destination" ]; then
+            for s in "$FTPS_STATE_DIR"/*; do
+                [ -f "$s" ] || continue
+                rm -f -- "$s" && records=$((records + 1))
+            done
+            # temp files of interrupted uploads belong to the old destination as well
+            rm -f -- "$FTPS_INPROGRESS_FILE"
+            bashio::log.warning "FTPs destination changed (${previous} -> ${destination}): forgot ${records} upload record(s), existing backups are uploaded again. The old destination is not touched"
+        fi
+    fi
+    printf '%s\n' "$destination" > "$FTPS_DESTINATION_FILE" 2>/dev/null || true
+}
+check_destination
+
 # remember remote server capabilities
 FTPS_AVBL_SUPPORTED="unknown" # check free space
 FTPS_SIZE_SUPPORTED="unknown" # check file size
-
-# warn about idling if both local copy and FTPs upload are disabled
-if [ "$LOCAL_COPY_ENABLED" != "true" ] && [ "$FTPS_ENABLED" != "true" ]; then
-    bashio::log.warning "Both local_copy_enabled and ftps_enabled are off; the app will watch ${SRC} but take no action on any file."
-fi
 
 # --- EVENTS ---
 
@@ -165,6 +197,34 @@ fire_event() {
 
 # --- FTP ---
 
+# is the server reachable at all (TCP connect to host and port, 5 s at most), otherwise sets FTPS_DOWN, which ends the current resync early (see scan_backups)
+# note: only used AFTER an lftp command failed, to avoid more slow attempts during an outage
+# note: says nothing about TLS or login, lftp reports those itself and quickly
+FTPS_DOWN="false"
+ftps_reachable() {
+    if timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "${FTPS_HOST//[\[\]]/}" "$FTPS_PORT" 2>/dev/null; then
+        FTPS_DOWN="false"
+    else
+        FTPS_DOWN="true"
+        return 1
+    fi
+}
+
+# did the server refuse our login (wrong user or password)? Sets FTPS_AUTH_FAILED, which ends the current round like FTPS_DOWN does:
+# a wrong password then costs one login per round instead of three per backup (fail2ban on the server could lock the address out)
+# note: only used on the output of a FAILED lftp command; lftp words it "Login failed: 530 ..." for every command
+FTPS_AUTH_FAILED="false"
+ftps_note_auth_failure() {
+    if printf '%s' "$1" | grep -Eqi 'Login failed: [45][0-9]{2}'; then
+        if [ "$FTPS_AUTH_FAILED" != "true" ]; then
+            FTPS_AUTH_FAILED="true"
+            bashio::log.warning "FTPs login refused: check ftps_user and ftps_password. Further attempts in this round are skipped"
+        fi
+        return 0
+    fi
+    return 1
+}
+
 # clean value for lftp command parser: wrap in double quotes, escape backslash and double quote
 lftp_quote() {
     local s="$1"
@@ -176,6 +236,8 @@ lftp_quote() {
 # prepare lftp prelude: protocol selection, cert verification, login, target dir.
 # explicit FTPs uses the ftp:// scheme and upgrades via AUTH TLS while "ftp:ssl-force" makes lftp refuse to log in if the server does not support TLS (lftp would otherwise fall back to plain FTP and send the password in cleartext)
 # implicit FTPs uses the ftps:// scheme, which negotiates TLS immediately on connect
+# important: minimum required is TLS 1.2: lftp has no "min-protocol" setting, only ssl:priority
+# note: "cd ." forces login first, so refusal ends the script instead of "mkdir -p -f" hiding it and "cd ..." logging in a second time
 ftps_prelude() {
     local scheme="ftp" ca_line=""
     if [ "$FTPS_IMPLICIT" = "true" ]; then
@@ -187,6 +249,7 @@ ftps_prelude() {
     cat <<EOF
 set ssl:verify-certificate ${FTPS_VERIFY_CERT}
 set ssl:check-hostname ${FTPS_CHECK_HOSTNAME}
+set ssl:priority "NORMAL:-VERS-SSL3.0:-VERS-TLS1.0:-VERS-TLS1.1"
 ${ca_line}
 set ftp:ssl-force true
 set ftp:ssl-protect-data true
@@ -197,6 +260,7 @@ set net:reconnect-interval-max 5
 set cmd:fail-exit yes
 open -p ${FTPS_PORT} $(lftp_quote "${scheme}://${FTPS_HOST}")
 user $(lftp_quote "$FTPS_USER") $(lftp_quote "$FTPS_PASSWORD")
+cd .
 mkdir -p -f $(lftp_quote "$FTPS_REMOTE_DIR")
 cd $(lftp_quote "$FTPS_REMOTE_DIR")
 EOF
@@ -208,27 +272,60 @@ ftps_run() {
     lftp -f /dev/stdin <<<"$(ftps_prelude)"$'\n'"$1"
 }
 
+# last 3 lines of lftp output $1 for the log, with the password masked
+# note: lftp is not expected to print it, this is only a safeguard. The pattern is quoted, so characters like * ? [ in the password are matched literally
+ftps_log_tail() {
+    local s="$1" q
+    q=$(lftp_quote "$FTPS_PASSWORD"); q=${q:1:-1}   # the form written into the lftp script (backslash and double quote escaped)
+    s=${s//"$FTPS_PASSWORD"/"***"}
+    s=${s//"$q"/"***"}
+    printf '%s' "$s" | tail -n 3
+}
+
 # ftp error classification; especially identify remote disk space constraints
+# note: only matches FTP replies, i.e. starting with reply code or "Access failed: " or "<--- " prefix, NOT number or word elsewhere in text (user name, file name, byte counts, our own messages)
 ftps_classify_error() {
-    if printf '%s' "$1" | grep -Eqi '(^|[^0-9])(452|552)([^0-9]|$)|disk full|quota|no space|insufficient storage'; then
+    # 452 (insufficient storage) and 552 (exceeded storage allocation) say it by themselves
+    if printf '%s' "$1" | grep -Eq '(^|Access failed: |<--- )(452|552)([^0-9]|$)'; then
+        echo "insufficient_space"
+    # servers that answer a full disk with a generic code (450, 451, 550) usually say so in the reply text
+    # note: the phrase must start the reply text (or follow a short lead-in like "file: " or "Could not write file. "), and a path never counts:
+    # the lead-in may not contain a "/" and the phrase may not be followed by one, so a server that echoes a folder called "no space" does not match
+    elif printf '%s' "$1" | grep -Eqi '(^|Access failed: |<--- )(45[01]|550)[ -]+([^:(/]*[:.] +)?(disk full|no space|not enough (disk )?space|insufficient (storage|space)|quota exceeded)([^/]|$)'; then
         echo "insufficient_space"
     else
         echo "upload_error"
     fi
 }
 
-# check free space on remote server; fails with return 1 only if the server reports less free space than needed
+# does lftp output $1 contain a 500-504 reply, ie the server answered the command itself with "unknown / not implemented"?
+# note: only to be used on the output of a FAILED command. Login, cd and transfer problems use other codes (530, 550, 4xx) or no reply at all and must never be mistaken for a missing command
+ftps_command_unsupported() {
+    printf '%s' "$1" | grep -Eq '(^|[^0-9])50[0-4]([^0-9]|$)'
+}
+
+# check free space on remote server
+# return "1" only if the server reports less free space than needed
+# return "2" if the server is not reachable or login refused (text in FTPS_ERROR, uploading would only wait for the same timeouts again)
 # note: a server not supporting the AVBL command is remembered, connection or login problems do not change that
 ftps_has_space() {
     [ "$FTPS_AVBL_SUPPORTED" != "no" ] || return 0
 
     local size="$1" out free
-    # not reachable or login failed: no statement about AVBL support possible, the upload will report that problem
+    # not reachable or login failed: no statement about AVBL support possible
     if ! out=$(ftps_run "quote AVBL" 2>&1); then
-        # a 5xx reply to the command itself means the server is reachable but lacks AVBL
-        if printf '%s' "$out" | grep -Eq '(^|[^0-9])50[0-4]([^0-9]|$)'; then
+        if ftps_note_auth_failure "$out"; then
+            # login refused: report it right away, the upload would only fail the same way again
+            FTPS_ERROR="$out"
+            return 2
+        elif ftps_command_unsupported "$out"; then
+            # avbl unsupported: a 5xx reply to the command itself means the server is reachable but lacks AVBL
             FTPS_AVBL_SUPPORTED="no"
             bashio::log.info "FTPs: server does not report free space"
+        elif ! ftps_reachable; then
+            # server down: report it right away; any other problem (eg login) is left to the upload, which reports it quickly
+            FTPS_ERROR="server not reachable: ${out}"
+            return 2
         fi
         return 0
     fi
@@ -248,13 +345,68 @@ ftps_has_space() {
     fi
 }
 
+# failure record of backup $2 (file $1): prints "attempts next_epoch reason"; fails if there is none for this exact file (same size and modification time)
+ftps_failure_record() {
+    local m fp attempts next reason
+    m=$(cat "${FAILED_DIR}/${2}" 2>/dev/null) || return 1
+    read -r fp attempts next reason <<<"$m" || return 1
+    [ "$fp" = "$(file_fingerprint "$1")" ] || return 1
+    echo "${attempts} ${next} ${reason}"
+}
+
+# check if retry of backup $2 (file $1) is due yet; it failed before and the wait has not passed
+ftps_backed_off() {
+    local rec attempts next reason
+    rec=$(ftps_failure_record "$1" "$2") || return 1
+    read -r attempts next reason <<<"$rec"
+    [ "$(date +%s)" -lt "$next" ]
+}
+
+# remember and report the failed upload of $2 (file $1, fingerprint $3) with reason $4, error text in FTPS_ERROR
+# - back-off: each attempt costs several logins and a persistent problem (eg wrong password) does not fix itself
+#   so the retry is only due at the 1st, 2nd, 4th, 8th ... hourly check after the failure
+#   (5 min less make sure the attempt's own duration does not push it to the next check)
+# - the failure event only fires for the first failure of a file and when the reason changes, not on every retry:
+#   an automation sending a notification would otherwise notify hourly. A later success fires new_backup_uploaded
+ftps_upload_failed() {
+    local f="$1" base="$2" fp="$3" reason="$4" now now_epoch rec attempts=0 next last_reason="" n delay detail=""
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    now_epoch=$(date +%s)
+    if rec=$(ftps_failure_record "$f" "$base"); then
+        read -r attempts next last_reason <<<"$rec"
+    fi
+    attempts=$((attempts + 1))
+    n=$((attempts - 1))
+    if [ "$n" -gt 5 ]; then n=5; fi
+    delay=$(( (1 << n) * RESYNC_CHECK_INTERVAL - 300 ))
+    if [ "$delay" -gt "$RETRY_MAX_DELAY" ]; then delay="$RETRY_MAX_DELAY"; fi
+
+    if [ -n "$FTPS_ERROR" ]; then detail=": $(ftps_log_tail "$FTPS_ERROR")"; fi
+    bashio::log.error "FTPs: failed to upload ${base} (${reason})${detail} - attempt ${attempts}, next retry in about $(( (delay + 300) / 3600 )) h"
+    if [ "$reason" != "$last_reason" ]; then
+        fire_event "new_backup_upload_failed" "$(event_payload "$base" "${FTPS_REMOTE_DIR:+${FTPS_REMOTE_DIR}/}${base}" "$now" "$reason")"
+    fi
+    printf '%s %s %s %s\n' "$fp" "$attempts" "$((now_epoch + delay))" "$reason" > "${FAILED_DIR}/${base}" 2>/dev/null || true
+}
+
+# the server just accepted an upload, so it is healthy: other failed backups can be retried on the next check as well
+ftps_release_backoff() {
+    local rec fp attempts next reason
+    for rec in "${FAILED_DIR}"/*; do
+        [ -f "$rec" ] || continue
+        read -r fp attempts next reason < "$rec" || continue
+        printf '%s %s 0 %s\n' "$fp" "$attempts" "$reason" > "$rec" 2>/dev/null || true
+    done
+}
+
 # is an FTPs upload of file $1 (basename $2) required? (enabled?, never uploaded? changed since?)
 # note: state file holds the fingerprint of the uploaded file
 # important: files remotely deleted manually will NOT be re-uploaded
 ftps_upload_needed() {
-    [ "$FTPS_ENABLED" = "true" ] || return 1
-    # ignore unencrypted backups, if not allowed
-    if backup_blocked "$1"; then return 1; fi
+    # skipped and reported already (see backup_skipped function): nothing to do until the file changes
+    if backup_skip_reported "$1" "$2"; then return 1; fi
+	# failed before and the retry is not due yet (see ftps_upload_failed)
+	if ftps_backed_off "$1" "$2"; then return 1; fi
     local state="${FTPS_STATE_DIR}/${2}"
     [ -f "$state" ] || return 0
     if [ ! -s "$state" ]; then
@@ -267,93 +419,256 @@ ftps_upload_needed() {
 
 # upload file to FTPs target dir, ie from $SRC
 ftps_upload() {
-    [ "$FTPS_ENABLED" = "true" ] || return 0
-
     local f="$1"
-    local base now size fp reason
+    local base now size fp reason space_rc=0
     base=$(basename "$f")
     now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     size=$(stat -c%s "$f" 2>/dev/null || echo 0)
     fp=$(file_fingerprint "$f")
 
     # check sufficient space on remote target
-    if ! ftps_has_space "$size"; then
-        fire_event "new_backup_upload_failed" "$(event_payload "$base" "${FTPS_REMOTE_DIR}/${base}" "$now" "insufficient_space")"
+    ftps_has_space "$size" || space_rc=$?
+    if [ "$space_rc" -eq 1 ]; then
+        FTPS_ERROR=""
+        ftps_upload_failed "$f" "$base" "$fp" "insufficient_space"
         return 1
     fi
 
     # upload via temp name and rename, so the final name only ever points to a complete file
     # note: not inside $(...), as ftps_put_atomic hands the error text back in FTPS_ERROR
-    if ftps_put_atomic "$f" "$base"; then
+    # note: skipped if the space check found the server not reachable (space_rc 2), its error text is reported below
+    if [ "$space_rc" -eq 0 ] && ftps_put_atomic "$f" "$base"; then
         bashio::log.info "FTPs: uploaded ${base}"
-        fire_event "new_backup_uploaded" "$(event_payload "$base" "${FTPS_REMOTE_DIR}/${base}" "$now")"
+        FTPS_AUTH_FAILED="false"
+        fire_event "new_backup_uploaded" "$(event_payload "$base" "${FTPS_REMOTE_DIR:+${FTPS_REMOTE_DIR}/}${base}" "$now")"
         # keep persistent track of the upload: state file holds fingerprint of the uploaded file
         echo "$fp" > "${FTPS_STATE_DIR}/${base}" 2>/dev/null || true
+        # healthy again: forget earlier failures of this file, the other failed backups may retry at the next check
+        rm -f -- "${FAILED_DIR}/${base}"
+        ftps_release_backoff
     else
         # document reason for upload failure
         reason=$(ftps_classify_error "$FTPS_ERROR")
-        bashio::log.error "FTPs: failed to upload ${base} (${reason}): $(printf '%s' "$FTPS_ERROR" | tail -n 3)"
-        fire_event "new_backup_upload_failed" "$(event_payload "$base" "${FTPS_REMOTE_DIR}/${base}" "$now" "${reason}")"
+        ftps_upload_failed "$f" "$base" "$fp" "$reason"
     fi
 }
 
+# remove our own leftover temp file $1 (a *.tar.tmp name) from the server (current remote dir)
+# note: lists first, so a file that is already gone counts as done; fails only if the server could not be reached or refused
+ftps_remove_remote_tmp() {
+    local name="$1" listing
+
+    [[ "$name" == *.tar.tmp && "$name" != */* ]] || return 0 # never touch anything but our own temp names
+    ftps_reachable || return 1 # server down: nothing can be removed now, the marker stays and the next check retries
+
+    if ! listing=$(ftps_run "cls -1" 2>&1); then
+        ftps_note_auth_failure "$listing" || true
+        return 1
+    fi
+    if printf '%s\n' "$listing" | grep -Fxq -- "$name"; then
+        ftps_run "rm -f $(lftp_quote "$name")" >/dev/null 2>&1 || return 1
+    fi
+}
+
+# marker file: one name per line, add / remove a single remote temp file name $1
+ftps_marker_add() {
+    grep -Fxq -- "$1" "$FTPS_INPROGRESS_FILE" 2>/dev/null || printf '%s\n' "$1" >> "$FTPS_INPROGRESS_FILE" 2>/dev/null || true
+}
+ftps_marker_remove() {
+    local rest
+    [ -f "$FTPS_INPROGRESS_FILE" ] || return 0
+    rest=$(grep -Fxv -- "$1" "$FTPS_INPROGRESS_FILE" 2>/dev/null) || true
+    if [ -n "$rest" ]; then
+        { printf '%s\n' "$rest" > "${FTPS_INPROGRESS_FILE}.new" && mv -f "${FTPS_INPROGRESS_FILE}.new" "$FTPS_INPROGRESS_FILE"; } 2>/dev/null || true
+    else
+        rm -f -- "$FTPS_INPROGRESS_FILE" 2>/dev/null || true
+    fi
+}
+
+# after a failed upload: remove the remote temp file $1 and forget the marker, the marker stays if that did not work (retried at next start)
+# note: only for atomic uploads; without them there is no temp file, and a final file is never deleted here (it might be the intact previous copy)
+ftps_drop_tmp() {
+    [ "$FTPS_ATOMIC_UPLOAD" = "true" ] || return 0
+    if ftps_remove_remote_tmp "$1"; then
+        ftps_marker_remove "$1"
+    fi
+}
+
+# at start (and at every hourly check): remove the remote temp files of uploads that a stop cut off
+# note: names remembered in $FTPS_INPROGRESS_FILE
+ftps_cleanup_interrupted() {
+    [ -s "$FTPS_INPROGRESS_FILE" ] || return 0
+    # login refused earlier in this round: do not try again
+    [ "$FTPS_AUTH_FAILED" != "true" ] || return 0
+    local names name
+    # one check for the server instead of a timeout per name
+    if ! ftps_reachable; then
+        bashio::log.warning "FTPs: server not reachable, leftovers of interrupted uploads are removed later"
+        return 0
+    fi
+    mapfile -t names < "$FTPS_INPROGRESS_FILE"
+    for name in "${names[@]}"; do
+        [ -n "$name" ] || continue
+        if ftps_remove_remote_tmp "$name"; then
+            bashio::log.info "FTPs: cleaned up after an interrupted upload (${name})"
+            ftps_marker_remove "$name"
+        else
+            bashio::log.warning "FTPs: could not remove ${name} left by an interrupted upload, will retry"
+            [ "$FTPS_AUTH_FAILED" != "true" ] || break   # login refused: the other names would fail the same way
+        fi
+    done
+}
+
 # upload file $1 as $2: first under a temp name, so the final name only ever points to a complete file
+# (with ftps_atomic_upload off: straight to the final name, for servers that do not allow renaming)
 # note: on failure the error text is left in FTPS_ERROR for the caller to classify and log
 FTPS_ERROR=""
 ftps_put_atomic() {
-    local f="$1" base="$2" tmp="$2.tmp" out local_size remote_size
+    local f="$1" base="$2" target="$2" old="$2.old" out listing local_size outfile pid attempt=1 size_rc=1 put_script merged_size rc=0
     FTPS_ERROR=""
 
-    if ! out=$(ftps_run "put $(lftp_quote "$f") -o $(lftp_quote "$tmp")" 2>&1); then
+    if [ "$FTPS_ATOMIC_UPLOAD" = "true" ]; then
+        target="${base}.tmp"
+        # remember the temp name until it is gone from the server, see ftps_cleanup_interrupted
+        ftps_marker_add "$target"
+    fi
+
+    # note: lftp runs in the background and the script waits for it: bash only runs a trap after a foreground command has finished,
+    # but "wait" is interrupted at once by a stop request (SIGTERM); not inside $(...), the trap would be deferred again
+    if ! outfile=$(mktemp /tmp/lftp_out.XXXXXX); then
+        FTPS_ERROR="cannot create temp file for the upload output"
+        ftps_drop_tmp "$target"
+        return 1
+    fi
+    # once the server is known to report sizes, ask for the size in the same session: one login less. The separate query below stays as the fallback
+    put_script="put $(lftp_quote "$f") -o $(lftp_quote "$target")"
+    if [ "$FTPS_SIZE_SUPPORTED" = "yes" ]; then
+        put_script+=$'\n'"quote SIZE $(lftp_quote "$target")"
+    fi
+    lftp -f /dev/stdin <<<"$(ftps_prelude)"$'\n'"$put_script" >"$outfile" 2>&1 &
+    pid=$!
+    wait "$pid" || rc=$?
+	out=$(cat "$outfile" 2>/dev/null) || true
+    rm -f -- "$outfile"
+    if [ "$rc" -ne 0 ]; then
         FTPS_ERROR="$out"
-        ftps_run "rm -f $(lftp_quote "$tmp")" >/dev/null 2>&1 || true
+        if ftps_note_auth_failure "$out"; then
+            # login refused: nothing was created on the server, so there is nothing to remove (and no further login to waste)
+            ftps_marker_remove "$target"
+        else
+            ftps_drop_tmp "$target"
+        fi
         return 1
     fi
 
     # verify size, unless the server is known not to report it
+    # note: "not supported" is only concluded from the server's own answer. A connection or other problem is retried, and if it persists the upload fails: a file that could not be verified is never published
     if [ "$FTPS_SIZE_SUPPORTED" != "no" ]; then
         local_size=$(stat -c%s "$f" 2>/dev/null || echo -1)
-        if remote_size=$(ftps_remote_size "$tmp"); then
-            FTPS_SIZE_SUPPORTED="yes"
-            if [ "$remote_size" != "$local_size" ]; then
-                FTPS_ERROR="size mismatch: local=${local_size} remote=${remote_size}"
-                ftps_run "rm -f $(lftp_quote "$tmp")" >/dev/null 2>&1 || true
+        # size already answered in the put session? (a failing SIZE there fails the whole session, so a good put with a reply means both worked)
+        if [ "$FTPS_SIZE_SUPPORTED" = "yes" ]; then
+            merged_size=$(printf '%s\n' "$out" | grep -Eo '213 [0-9]+' | tail -1 | awk '{print $2}')
+            if [[ "$merged_size" =~ ^[0-9]+$ ]]; then
+                FTPS_REMOTE_SIZE="$merged_size"
+                size_rc=0
+            fi
+        fi
+        while [ "$size_rc" -ne 0 ]; do
+            size_rc=0
+            ftps_remote_size "$target" || size_rc=$?
+            # 0 = size known, 2 = server has no SIZE command: nothing to retry
+            if [ "$size_rc" -ne 1 ] || [ "$attempt" -ge 3 ]; then break; fi
+            ftps_reachable || break # server down: retrying would only wait for the same timeouts
+            attempt=$((attempt + 1))
+            # note: wait instead of a foreground sleep, so a stop request (SIGTERM) is handled at once
+            sleep 5 & wait $! || true
+        done
+        case "$size_rc" in
+            0)
+                FTPS_SIZE_SUPPORTED="yes"
+                FTPS_ERROR=""
+                if [ "$FTPS_REMOTE_SIZE" != "$local_size" ]; then
+                    FTPS_ERROR="size mismatch: local=${local_size} remote=${FTPS_REMOTE_SIZE}"
+                    ftps_drop_tmp "$target"
+                    return 1
+                fi
+                ;;
+            2)
+                FTPS_SIZE_SUPPORTED="no"
+                FTPS_ERROR=""
+                bashio::log.info "FTPs: server does not report file sizes, uploads are not verified"
+                ;;
+            *)
+                FTPS_ERROR="could not verify the size of the uploaded file after ${attempt} attempts: ${FTPS_ERROR}"
+                ftps_drop_tmp "$target"
+                return 1
+                ;;
+        esac
+    fi
+
+    # direct upload: already under the final name
+    [ "$FTPS_ATOMIC_UPLOAD" = "true" ] || return 0
+
+    # publish: plain rename first
+    if ! out=$(ftps_run "mv $(lftp_quote "$target") $(lftp_quote "$base")" 2>&1); then
+        # only if the reply says the target already exists: move the previous version aside, publish, then drop it
+        # note: the previous copy is never deleted before the new one is in place, and is put back if publishing fails
+        if printf '%s' "$out" | grep -Eqi '(^|Access failed: |<--- )[45][0-9]{2}[ -][^(]*(exists|already|overwrit)'; then
+            if out=$(ftps_run "rm -f $(lftp_quote "$old")"$'\n'"mv $(lftp_quote "$base") $(lftp_quote "$old")"$'\n'"mv $(lftp_quote "$target") $(lftp_quote "$base")" 2>&1); then
+                ftps_run "rm -f $(lftp_quote "$old")" >/dev/null 2>&1 || true
+            else
+                # put the previous version back, but only if it was moved aside and the final name is empty
+                if listing=$(ftps_run "cls -1" 2>/dev/null) \
+                    && printf '%s\n' "$listing" | grep -Fxq -- "$old" \
+                    && ! printf '%s\n' "$listing" | grep -Fxq -- "$base"; then
+                    ftps_run "mv $(lftp_quote "$old") $(lftp_quote "$base")" >/dev/null 2>&1 || true
+                fi
+                FTPS_ERROR="$out"
+                ftps_drop_tmp "$target"
                 return 1
             fi
         else
-            # the server just accepted the upload, so assume it does not report sizes
-            FTPS_SIZE_SUPPORTED="no"
-            bashio::log.info "FTPs: server does not report file sizes, uploads are not verified"
-        fi
-    fi
-
-    # try a plain rename first, remove an old version only if the server refuses to overwrite
-    if ! out=$(ftps_run "mv $(lftp_quote "$tmp") $(lftp_quote "$base")" 2>&1); then
-        ftps_run "rm -f $(lftp_quote "$base")" >/dev/null 2>&1 || true
-        if ! out=$(ftps_run "mv $(lftp_quote "$tmp") $(lftp_quote "$base")" 2>&1); then
             FTPS_ERROR="$out"
+            ftps_drop_tmp "$target"
             return 1
         fi
     fi
+    ftps_marker_remove "$target"
 }
 
-# size of remote file $1 in bytes (current remote dir); fails if the server does not answer SIZE
+# size of remote file $1 in bytes (current remote dir), result in FTPS_REMOTE_SIZE
+# returns 0 = size known, 2 = server does not know the SIZE command, 1 = any other problem (connection, login, unexpected reply), which says nothing about SIZE support
+# note: the error text of a failed query is left in FTPS_ERROR, so call this directly and not inside $(...)
+FTPS_REMOTE_SIZE=""
 ftps_remote_size() {
     local out size
-    out=$(ftps_run "quote SIZE $(lftp_quote "$1")" 2>/dev/null) || return 1
+    FTPS_REMOTE_SIZE=""
+    if ! out=$(ftps_run "quote SIZE $(lftp_quote "$1")" 2>&1); then
+        if ftps_command_unsupported "$out"; then return 2; fi
+        FTPS_ERROR="$out"
+        return 1
+    fi
     size=$(printf '%s\n' "$out" | grep -Eo '213 [0-9]+' | tail -1 | awk '{print $2}')
-    [[ "$size" =~ ^[0-9]+$ ]] || return 1
-    echo "$size"
+    if ! [[ "$size" =~ ^[0-9]+$ ]]; then
+        FTPS_ERROR="unexpected reply to SIZE: ${out}"
+        return 1
+    fi
+    FTPS_REMOTE_SIZE="$size"
 }
 
 # mirror deletions on FTPs server, ie remove files this app uploaded (recorded in $FTPS_STATE_DIR) that no longer exist in $SRC
 # note: all pending deletions share a single connection, without any pending deletion no connection is made
+# note: with "quiet" as parameter (hourly check) the "no backups" notice is only logged at debug level, to not repeat it every hour
 ftps_sync_deletions() {
-    [ "$FTPS_ENABLED" = "true" ] || return 0
     [ "$FTPS_SYNC_DELETIONS" = "true" ] || return 0
+    # login refused earlier in this round: do not try again
+    [ "$FTPS_AUTH_FAILED" != "true" ] || return 0
 
-    # ensure sync does not delete all backup copies, if source does not exist or is (temporarily) not available
-    source_without_backups || { bashio::log.warning "No backups in ${SRC}, skipping deletion sync"; return 0; }
+    # ensure sync does not delete all backup uploads, if source does not exist or is (temporarily) not available
+    if ! source_without_backups; then
+        [ "${1:-}" = "quiet" ] || bashio::log.warning "No backups in ${SRC}, skipping deletion sync"
+        return 0
+    fi
 
     local state_file base out listing script=""
     local -a pending=() present=()
@@ -370,7 +685,9 @@ ftps_sync_deletions() {
     [ "${#pending[@]}" -gt 0 ] || return 0
 
     # one listing tells which of OUR recorded files still exist on the server, nothing else is ever deleted
-    if ! listing=$(ftps_run "cls -1" 2>/dev/null); then
+    # note: on server down: skip, as it would cost time(out) and fail anyhow
+    if ! ftps_reachable || ! listing=$(ftps_run "cls -1" 2>&1); then
+        ftps_note_auth_failure "${listing:-}" || true
         bashio::log.warning "FTPs: could not list remote dir, deletion sync will retry on next sync"
         return 0
     fi
@@ -394,14 +711,13 @@ ftps_sync_deletions() {
             rm -f -- "${FTPS_STATE_DIR}/${base}" 2>/dev/null || true
         done
     else
-        bashio::log.warning "FTPs: failed to delete ${#present[@]} file(s), will retry on next sync: $(printf '%s' "$out" | tail -n 3)"
+        bashio::log.warning "FTPs: failed to delete ${#present[@]} file(s), will retry on next sync: $(ftps_log_tail "$out")"
     fi
 }
 
 # remove upload state files of backups that no longer exist in $SRC (local only, no network)
 # note: with deletion sync enabled, ftps_sync_deletions already handles this
 ftps_cleanup_state() {
-    [ "$FTPS_ENABLED" = "true" ] || return 0
     if [ "$FTPS_SYNC_DELETIONS" = "true" ]; then
         return 0
     fi
@@ -413,115 +729,6 @@ ftps_cleanup_state() {
     for s in "${FTPS_STATE_DIR}"/*; do
         [ -f "$s" ] || continue
         [ -f "${SRC}/$(basename "$s")" ] || rm -f -- "$s"
-    done
-}
-
-# --- LOCAL ---
-
-# is a local copy of file $1 (basename $2) required? (enabled?, missing? different size?)
-local_copy_needed() {
-    [ "$LOCAL_COPY_ENABLED" = "true" ] || return 1
-    # ignore unencrypted backups, if not allowed
-    if backup_blocked "$1"; then return 1; fi
-    [ -f "${DEST}/${2}" ] || return 0
-    [ "$(stat -c%s "$1" 2>/dev/null)" != "$(stat -c%s "${DEST}/${2}" 2>/dev/null)" ]
-}
-
-# free bytes on the filesystem containing $1
-free_bytes() {
-    local kb
-    kb=$(df -Pk "$1" 2>/dev/null | awk 'NR==2 {print $4}')
-    [[ "$kb" =~ ^[0-9]+$ ]] || return 1
-    echo $((kb * 1024))
-}
-
-# enough room in $DEST for a file of $1 bytes? (unknown free space = proceed)
-local_has_space() {
-    local size="$1" free
-    free=$(free_bytes "$DEST") || {
-        bashio::log.warning "Could not determine free space in ${DEST}, copying anyway"
-        return 0
-    }
-    if [ "$free" -lt $((size + LOCAL_FREE_BYTES)) ]; then
-        bashio::log.error "Not enough space in ${DEST}: need ${size} + ${LOCAL_FREE_BYTES} margin, have ${free}"
-        return 1
-    fi
-}
-
-# local copy and verification, ie copy new file from $SRC to $DEST
-local_copy() {
-    [ "$LOCAL_COPY_ENABLED" = "true" ] || return 0
-
-    local f="$1" base="$2" now
-    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-	# make sure the folder exists
-    mkdir -p "$DEST"
-
-    # check sufficient space on local target
-    local src_size_pre
-    src_size_pre=$(stat -c%s "$f" 2>/dev/null || echo 0)
-    if ! local_has_space "$src_size_pre"; then
-        fire_event "new_backup_copy_failed" "$(event_payload "$base" "${DEST}/${base}" "$now" "insufficient_space")"
-        return 1
-    fi
-
-    # copy in the background and wait for it, so a stop request can interrupt even a long copy (see on_stop)
-    local tmp="${DEST}/${base}.tmp" copy_ok="true"
-    # remember the currently handled file in case copy gets interrupted
-    CURRENT_TMP="$tmp"
-    # start copying with "&" continue script while operation is ongoing
-    cp -f "$f" "$tmp" &
-    # remember the current process id of the copy "$!" in case copy gets interrupted
-    CP_PID=$!
-    # now wait for the copy to complete, then rename the file - and in case of error flag as not ok
-    { wait "$CP_PID" && mv -f "$tmp" "${DEST}/${base}"; } || copy_ok="false"
-    CP_PID=""
-    CURRENT_TMP=""
-    if [ "$copy_ok" != "true" ]; then
-        # remove leftovers in case copying fails
-        rm -f -- "${DEST}/${base}.tmp"
-        bashio::log.error "Failed to copy ${base}"
-        fire_event "new_backup_copy_failed" "$(event_payload "$base" "${DEST}/${base}" "$now")"
-        return 1
-    fi
-
-    # verify copy by comparing file sizes as simple reliable integrity check
-    local src_size dest_size
-    src_size=$(stat -c%s "$f" 2>/dev/null || echo -1)
-    dest_size=$(stat -c%s "${DEST}/${base}" 2>/dev/null || echo -2)
-    if ! { [ "$src_size" -eq "$dest_size" ] && [ "$src_size" -gt 0 ]; }; then
-        bashio::log.error "Size mismatch copying ${base}: src=${src_size} dest=${dest_size}"
-        # remove bad copy so the resync loop retries later
-        rm -f -- "${DEST}/${base}"
-        fire_event "new_backup_copy_failed" "$(event_payload "$base" "${DEST}/${base}" "$now" "size_mismatch")"
-        return 1
-    fi
-
-    bashio::log.info "Copied and verified ${base} (${dest_size} bytes) to ${DEST}/${base}"
-    fire_event "new_backup_copied" "$(event_payload "$base" "${DEST}/${base}" "$now")"
-    return 0
-}
-
-# mirror deletions in local target folder, ie remove any file from $DEST that no longer exists in $SRC
-local_sync_deletions() {
-    [ "$LOCAL_COPY_ENABLED" = "true" ] || return 0
-    [ "$LOCAL_SYNC_DELETIONS" = "true" ] || return 0
-
-    # ensure sync does not delete all backup copies, if source does not exists or is (temporarily) not available
-    source_without_backups || { bashio::log.warning "No backups in ${SRC}, skipping deletion sync"; return 0; }
-
-    local dest_file base
-    for dest_file in "${DEST}"/*.tar; do
-        [ -e "$dest_file" ] || continue
-        base=$(basename "$dest_file")
-        if [ ! -f "${SRC}/${base}" ]; then
-            if rm -f -- "$dest_file"; then
-                bashio::log.info "Local: deleted ${base}"
-            else
-                bashio::log.warning "Local: failed to delete ${base}"
-            fi
-        fi
     done
 }
 
@@ -543,22 +750,60 @@ file_fingerprint() {
     stat -c '%s:%Y' "$1" 2>/dev/null || echo "missing"
 }
 
-# determine encryption state of backup $1: "encrypted", "plain" or "unknown" (unreadable, no flag)
-# note: backup.json is stored unencrypted inside the backup tar, tar skips over the large inner archives
+# encryption: determine state of backup $1: "encrypted", "plain" or "unknown" (unreadable, invalid, no or non-boolean flag)
+# note: results are cached on disk per file (size and modification time), as this runs in subshells and in a background job
 backup_encryption() {
-    local meta protected
-    meta=$(tar -xOf "$1" ./backup.json 2>/dev/null || tar -xOf "$1" backup.json 2>/dev/null) || meta=""
-    protected=$(printf '%s' "$meta" | jq -e '.protected == true' 2>/dev/null) || protected=""
-    case "$protected" in
-        true)  echo "encrypted" ;;
-        false) echo "plain" ;;
-        *)     echo "unknown" ;;
+    local f="$1" fp key cached meta state tmp
+    fp=$(file_fingerprint "$f")   # taken before reading, so a file changing meanwhile is never cached under its new fingerprint
+    key="${ENCRYPTION_CACHE_DIR}/$(printf '%s' "$f" | md5sum | cut -d' ' -f1)"
+
+    # cache hit: file unchanged since it was read
+    if [ "$fp" != "missing" ] && cached=$(cat "$key" 2>/dev/null) && [ "${cached%% *}" = "$fp" ]; then
+        echo "${cached#* }"
+        return 0
+    fi
+
+    # backup.json is stored unencrypted inside the backup tar, tar skips over the large inner archives
+    # read at most $BACKUP_JSON_MAX_BYTES: head closing the pipe early ends tar with SIGPIPE, which is fine (a truncated file is invalid JSON, so "unknown")
+    meta=$({ tar -xOf "$f" ./backup.json 2>/dev/null || tar -xOf "$f" backup.json 2>/dev/null || true; } | head -c "$BACKUP_JSON_MAX_BYTES")
+    # strict: only a JSON boolean true is "encrypted", only false is "plain", everything else (also "true", 1, a missing flag, several documents) is "unknown"
+    state=$(printf '%s' "$meta" | jq -r 'if .protected == true then "encrypted" elif .protected == false then "plain" else "unknown" end' 2>/dev/null) || state=""
+    case "$state" in
+        encrypted|plain) ;;
+        *) echo "unknown"; return 0 ;;   # not cached, eg a backup still being written
     esac
+
+    # remember result: every writer gets its own temp file and renames it, so parallel runs never touch each other's file
+    # note: even failing to cache is harmless, the next run just reads the backup again
+    if [ "$fp" != "missing" ]; then
+        if tmp=$(mktemp "${key}.XXXXXX" 2>/dev/null); then
+            { printf '%s %s\n' "$fp" "$state" > "$tmp" && mv -f "$tmp" "$key"; } 2>/dev/null || rm -f -- "$tmp"
+        fi
+    fi
+    echo "$state"
 }
-# true = backup $1 must be left alone, because unencrypted backups are not allowed and it is not (verifiably) encrypted
-backup_blocked() {
-    [ "$ALLOW_UNENCRYPTED" != "true" ] || return 1
-    [ "$(backup_encryption "$1")" != "encrypted" ]
+
+# encryption: was backup $1 (basename $2) already skipped and reported in its current form (same size and modification time)?
+backup_skip_reported() {
+    local m
+    m=$(cat "${SKIPPED_DIR}/${2}" 2>/dev/null) || return 1
+    [ "${m%% *}" = "$(file_fingerprint "$1")" ]
+}
+
+# encryption: report backup left alone: $1 file, $2 basename, $3 reason (not_encrypted | unreadable), $4 fingerprint
+# note: issue a warning in the log plus an event only once per file state: remembered in $SKIPPED_DIR, so repeated events and resyncs stay quiet until the file changes - "memory" is kept in /tmp, so it ends with a restart, which is also when a changed allow_unencrypted_backups takes effect
+backup_skipped() {
+	local f="$1" base="$2" reason="$3" fp="$4" now level="warning"
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    # during the startup resync the summary of warn_unencrypted_backups already warned, the per-file lines then only add the names: info
+    if [ "$STARTUP_SYNC" = "true" ]; then level="info"; fi
+    if [ "$reason" = "not_encrypted" ]; then
+        bashio::log.${level} "${base} is not encrypted: skipping it. Enable backup encryption in Home Assistant, or set allow_unencrypted_backups in the app configuration"
+    else
+        bashio::log.${level} "${base} could not be read as a Home Assistant backup (no valid backup.json found): skipping it"
+    fi
+    fire_event "new_backup_skipped" "$(event_payload "$base" "$f" "$now" "$reason")"
+    printf '%s %s\n' "$fp" "$reason" > "${SKIPPED_DIR}/${base}" 2>/dev/null || true
 }
 
 # process new file detected in $SRC
@@ -570,21 +815,11 @@ process_file() {
             local base
             base=$(basename "$f")
 
-            # policy: leave unencrypted backups alone, unless explicitly allowed
-            if backup_blocked "$f"; then
-                bashio::log.warning "${base} is not recognised as encrypted: skipping it. Enable backup encryption in Home Assistant, or set allow_unencrypted_backups in the app configuration"
-                return 0
-            fi
-
-            # nothing to do if file was already handled (eg repeated events, restart)
-            if ! local_copy_needed "$f" "$base" && ! ftps_upload_needed "$f" "$base"; then
-                bashio::log.debug "${base} already handled, skipping"
+            # nothing to do if file was already handled (eg repeated events, restart), or was skipped and reported in its current form
+            if ! ftps_upload_needed "$f" "$base"; then
                 return 0
             fi
             bashio::log.info "Detected new backup: ${base}"
-            if [ "$(backup_encryption "$f")" = "plain" ]; then
-                bashio::log.warning "${base} is not encrypted: the copies made by this app will contain secrets in plain text"
-            fi
 
             # wait until file size is stable before acting, to avoid acting during creation
             # note: safety check for some cases where the file is "produced" in consecutive writes
@@ -623,10 +858,31 @@ process_file() {
                 waited=$((waited + poll_interval))
             done
 
-            # new backup file is stable, what needs to be done?
-            if local_copy_needed "$f" "$base"; then
-                local_copy "$f" "$base" || true
+            # policy: leave unencrypted backups alone, unless explicitly allowed
+            # note: checked only now, a backup still being written has no readable backup.json yet
+            local fp enc reason age
+            fp=$(file_fingerprint "$f")
+            enc=$(backup_encryption "$f")
+            if [ "$ALLOW_UNENCRYPTED" != "true" ] && [ "$enc" != "encrypted" ]; then
+                if [ "$enc" = "plain" ]; then
+                    reason="not_encrypted"
+                else
+                    reason="unreadable"
+                    # a young file might just be slow to finish: no verdict yet, the next event or resync checks again
+                    age=$(( $(date +%s) - $(stat -c%Y "$f" 2>/dev/null || date +%s) ))
+                    if [ "$age" -lt "$RESYNC_MIN_AGE" ]; then
+                        bashio::log.info "${base} has no readable backup.json yet, will check again later"
+                        return 0
+                    fi
+                fi
+                backup_skipped "$f" "$base" "$reason" "$fp"
+                return 0
             fi
+            if [ "$enc" = "plain" ]; then
+                bashio::log.warning "${base} is not encrypted: the uploads made by this app will contain secrets in plain text"
+            fi
+
+            # new backup file is stable and allowed, what needs to be done?
             if ftps_upload_needed "$f" "$base"; then
                 ftps_upload "$f"
             fi
@@ -646,6 +902,8 @@ RESYNC_CHECK_INTERVAL=3600  # seconds / 1 hour as we only handle backups = 24 ch
 scan_backups() {
     local mode="${1:-}" f now mtime base
 
+    FTPS_DOWN="false" # set again by the first probe that finds the server down during this pass
+
     now=$(date +%s)
     for f in "${SRC}"/*.tar; do
         # skip the literal "*.tar" response bash leaves when no backups exist
@@ -655,10 +913,19 @@ scan_backups() {
         [ $((now - mtime)) -ge "$RESYNC_MIN_AGE" ] || continue
 
         if [ "$mode" = "sync" ]; then
+            # login already refused in this round (for example by the cleanup before): the next round tries again
+            [ "$FTPS_AUTH_FAILED" != "true" ] || break
             process_file "$f" || true
+            # server down: the other backups would only run into the same timeouts, the next check retries them
+            if [ "$FTPS_DOWN" = "true" ]; then
+                bashio::log.warning "FTPs server not reachable: remaining uploads wait for the next check"
+                break
+            fi
+            # login refused: every other backup would fail the same way
+            [ "$FTPS_AUTH_FAILED" != "true" ] || break
         else
             base=$(basename "$f")
-            if local_copy_needed "$f" "$base" || ftps_upload_needed "$f" "$base"; then
+            if ftps_upload_needed "$f" "$base"; then
                 return 0
             fi
         fi
@@ -667,7 +934,6 @@ scan_backups() {
     if [ "$mode" != "sync" ]; then
         return 1
     fi
-    local_sync_deletions || true
     ftps_sync_deletions || true
     ftps_cleanup_state || true
 }
@@ -675,6 +941,7 @@ scan_backups() {
 # watch for files fully written (close_write) to renamed/moved into place (moved_to) to $SRC and removals (delete, moved_from)
 MAX_FAST_FAILURES=10  # number (reset to 0 upon first non-"fast" restart required)
 FAST_FAILURE_WINDOW=30  # seconds (restart faster than this counts as "fast")
+STARTUP_SYNC="true" # until the first resync after start is done
 watch_backups() {
     local fast_failure_count=0
     local start_ts end_ts elapsed next_check remaining fd line event filename rc
@@ -687,8 +954,14 @@ watch_backups() {
         bashio::log.info "Start inotifywait watch on ${SRC}"
         exec {fd}< <(inotifywait -m -e close_write -e moved_to -e delete -e moved_from --format '%e %f' "$SRC")
 
+        # a new round: login problems are tried again
+        FTPS_AUTH_FAILED="false"
+        # remove the remote temp file of an upload a hard stop cut off, before new uploads reuse the names
+        ftps_cleanup_interrupted || true
+
         # resync in case events were missed while the watch was down
         scan_backups "sync"
+		STARTUP_SYNC="false"
         next_check=$(($(date +%s) + RESYNC_CHECK_INTERVAL))
 
         # handle queued and new events, check regularly whether anything is still not fully handled
@@ -696,9 +969,18 @@ watch_backups() {
             remaining=$((next_check - $(date +%s)))
             if [ "$remaining" -le 0 ]; then
                 next_check=$(($(date +%s) + RESYNC_CHECK_INTERVAL))
+                # a new round: login problems are tried again
+                FTPS_AUTH_FAILED="false"
+                # retry cleanup failed before (server unreachable); only local check if nothing is left
+                ftps_cleanup_interrupted || true
                 if scan_backups; then
                     bashio::log.info "Some backups are not fully handled yet, retrying"
-                    scan_backups "sync"
+                    scan_backups "sync"   # includes the deletion sync and state cleanup
+                else
+                    # nothing to upload, but a missed delete event may still have left a stale copy on the server
+                    # note: compares local files only, connects to the server just if a deletion is actually pending
+                    ftps_sync_deletions quiet || true
+                    ftps_cleanup_state || true
                 fi
                 continue
             fi
@@ -719,7 +1001,6 @@ watch_backups() {
                     DELETE*|MOVED_FROM*) ;;
                     *) process_file "${SRC}/${filename}" || true ;;
                 esac
-                local_sync_deletions || true
                 ftps_sync_deletions || true
                 ftps_cleanup_state || true
             elif [ "$rc" -le 128 ]; then
@@ -754,12 +1035,17 @@ watch_backups() {
 # warn (only) if backups exist that are not recognised as encrypted
 # note: meant to run in the background, so reading every backup.json never delays the start of the watch
 warn_unencrypted_backups() {
-    local f total=0 unencrypted=0
+    local f base total=0 unencrypted=0 uploaded=""
     for f in "${SRC}"/*.tar; do
         [ -e "$f" ] || continue
         total=$((total + 1))
         if [ "$(backup_encryption "$f")" != "encrypted" ]; then
             unencrypted=$((unencrypted + 1))
+            # uploaded earlier, while unencrypted backups were still allowed: that copy stays on the server
+            base=$(basename "$f")
+            if [ "$ALLOW_UNENCRYPTED" != "true" ] && [ -f "${FTPS_STATE_DIR}/${base}" ]; then
+                uploaded+="${uploaded:+, }${base}"
+            fi
         fi
     done
 
@@ -767,9 +1053,17 @@ warn_unencrypted_backups() {
     [ "$unencrypted" -gt 0 ] || return 0
 
     if [ "$ALLOW_UNENCRYPTED" = "true" ]; then
-        bashio::log.warning "${unencrypted} of ${total} backups in ${SRC} are not recognised as encrypted: their copies will contain secrets in plain text"
+        bashio::log.warning "${unencrypted} of ${total} backups in ${SRC} are not recognised as encrypted: their uploads will contain secrets in plain text"
     else
-        bashio::log.warning "${unencrypted} of ${total} backups in ${SRC} are not recognised as encrypted: they will not be copied / uploaded"
+        bashio::log.warning "${unencrypted} of ${total} backups in ${SRC} are not recognised as encrypted: they will not be uploaded"
+    fi
+
+    if [ -n "$uploaded" ]; then
+        if [ "$FTPS_SYNC_DELETIONS" = "true" ]; then
+            bashio::log.warning "Not encrypted, but uploaded earlier and still on the FTPs server: ${uploaded}. They are removed from the server once the backup is deleted here"
+        else
+            bashio::log.warning "Not encrypted, but uploaded earlier and still on the FTPs server: ${uploaded}. They are NOT removed automatically (ftps_sync_deletions is off): delete them on the server if unwanted"
+        fi
     fi
 }
 

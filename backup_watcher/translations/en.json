@@ -2,31 +2,15 @@
   "configuration": {
     "allow_unencrypted_backups": {
       "name": "Allow unencrypted backups",
-      "description": "IMPORTANT: Syncing unencrypted backups to '/share' locally or a remote location might expose sensitive data like secrets in plaintext! No backups without encryption flag will be handled, without explicit permission here"
-    },
-    "local_copy_enabled": {
-      "name": "Local Copy",
-      "description": "Sync local copy of files in the '/backup' directory to a '/share' subfolder accessible within HA Core for automations and scripts"
-    },
-    "local_copy_subdir": {
-      "name": "Local folder",
-      "description": "Local target folder underneath '/share', separate multiple layers by a '/' slash charater, eg 'backups/your-choice'"
-    },
-    "local_sync_deletions": {
-      "name": "Local Sync Deletions",
-      "description": "Delete backups from local target folder underneath '/share' once they are removed from the '/backup' directory, eg by the Home Assistant setting to keep only last 3 backups"
-    },
-    "ftps_enabled": {
-     "name": "FTPs Upload",
-      "description": "Enable sync of files in the '/backup' directory to a FTPs server"
+      "description": "IMPORTANT: Syncing unencrypted backups to a remote location might expose sensitive data like secrets in plaintext! No backups without encryption flag will be handled, without explicit permission here. Turning this off will not remove any unencrypted copies transferred earlier"
     },
     "ftps_host": {
      "name": "FTPs Host",
-     "description": "IP address or domain hostname of FTPs server"
+     "description": "IP address or domain hostname of FTPs server, use [brackets] for IPv6 addresses"
     },
     "ftps_port": {
      "name": "FTPs Port",
-     "description": "Port of FTPs server, usually 21"
+     "description": "Port of FTPs server, usually 21 for explicit mode and 990 for implicit one"
     },
     "ftps_user": {
      "name": "FTPs Username",
@@ -44,21 +28,25 @@
       "name": "FTPs Certificate",
      "description": "Verify FTPs server certificate"
     },
-    "ftps_check_hostname": {
-      "name": "FTPs Check Hostname",
-      "description": "Verify FTPs server hostname, in case of issues disable this in case you use a self-signed certificate"
-    },
     "ftps_ca_file": {
       "name": "FTPs Self-Signed Certificate",
       "description": "Optional: File name of a PEM / CA certificate to verify the FTPs server, stored within this app's configuration folder, e.g. 'ftps_ca.pem'. Leave empty to use the system certificates. 'FTPs Host' above has to match the certificate."
     },
+    "ftps_check_hostname": {
+      "name": "FTPs Check Hostname",
+      "description": "Verify FTPs server hostname, if you use a self-signed certificate disable this in case of issues"
+    },
     "ftps_remote_dir": {
       "name": "FTPs Path",
-      "description": "Target folder at FTPs server, ensure ending with '/' slash character, e.g. 'backups/'"
+	  "description": "Relative target folder at FTPs server, leave empty for login directory"
     },
     "ftps_sync_deletions": {
       "name": "FTPs Sync Deletions",
       "description": "Delete backups from FTPs server once they are removed locally"
+    },
+    "ftps_atomic_upload": {
+      "name": "FTPs Atomic Upload",
+      "description": "Upload with temporary name and rename once complete. Turn off only if renaming files is not allowed for the FTP user."
     }
   }
 }

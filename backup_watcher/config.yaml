@@ -1,7 +1,7 @@
 name: "Backup Watcher"
-version: "1.1.0"
+version: "2.0.0"
 slug: "backup_watcher"
-description: "Watch for new backups created, sync to local core accessible folder, upload to server via FTPs - this app monitors the /backup folder for new files and syncs these to defined local folder within /share directory accessible from Core for any automations and scripts and / or uploads these backup files to a remote FTP server using FTPs (implicitly or explicitly, not requiring SFTP)"
+description: "Watch new backups created and sync to remote server via FTPs (implicitly or explicitly, not requiring SFTP)"
 url: "https://github.com/th23x/th23-backup-watcher"
 arch:
   - aarch64
@@ -11,41 +11,33 @@ homeassistant_api: true
 map:
   - type: backup
     read_only: true
-  - type: share
-    read_only: false
   - type: addon_config
     read_only: true
 boot: auto
 startup: application
 options:
   allow_unencrypted_backups: false
-  local_copy_enabled: true
-  local_copy_subdir: "backups"
-  local_sync_deletions: true
-  ftps_enabled: false
   ftps_host: ""
   ftps_port: 21
   ftps_user: ""
   ftps_password: ""
   ftps_implicit: false
   ftps_verify_cert: true
-  ftps_check_hostname: true
   ftps_ca_file: ""
-  ftps_remote_dir: "/backups"
+  ftps_check_hostname: true
+  ftps_remote_dir: "backups"
   ftps_sync_deletions: false
+  ftps_atomic_upload: true
 schema:
   allow_unencrypted_backups: bool
-  local_copy_enabled: bool
-  local_copy_subdir: str
-  local_sync_deletions: bool
-  ftps_enabled: bool
-  ftps_host: str
+  ftps_host: 'match(^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)?\Z)'
   ftps_port: port
-  ftps_user: str
+  ftps_user: 'match(^[^\x00-\x1f\x7f]{0,128}\Z)'
   ftps_password: password
   ftps_implicit: bool
   ftps_verify_cert: bool
+  ftps_ca_file: 'match(^([A-Za-z0-9_][A-Za-z0-9._-]{0,100})?\Z)?'
   ftps_check_hostname: bool
-  ftps_ca_file: str?
-  ftps_remote_dir: str
+  ftps_remote_dir: 'match(^((?!.*(?:^|/)\.\.(?:/|\Z))[^\x00-\x1f\x7f/][^\x00-\x1f\x7f]{0,254})?\Z)'
   ftps_sync_deletions: bool
+  ftps_atomic_upload: bool?
